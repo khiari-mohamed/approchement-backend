@@ -5,6 +5,10 @@ load_dotenv()
 
 # API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
+
+# AI Fallback Strategy: Try Gemini first, then Claude, then backend logic
+ENABLE_AI_FALLBACK = True
 
 # Database
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./reconciliation.db")
@@ -36,5 +40,6 @@ DEFAULT_RULES = {
 AI_CONFIG = {
     "temperature": 0.1,
     "max_output_tokens": 50,
-    "model_name": "gemini-2.0-flash-exp"
+    "gemini_model": "gemini-2.0-flash-exp",
+    "claude_model": "claude-3-haiku-20240307"
 }

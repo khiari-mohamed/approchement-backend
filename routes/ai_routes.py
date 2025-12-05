@@ -10,12 +10,14 @@ router = APIRouter()
 async def get_label_similarity(request: AIRequest):
     """Compare similarity between two transaction labels"""
     try:
-        score = compare_labels(request.label1, request.label2)
+        result = compare_labels(request.label1, request.label2)
+        score = result.get("score", 0.0) if isinstance(result, dict) else result
         return {
             "label1": request.label1,
             "label2": request.label2,
             "similarity": score,
-            "confidence": "high" if score > 0.8 else "medium" if score > 0.6 else "low"
+            "confidence": "high" if score > 0.8 else "medium" if score > 0.6 else "low",
+            "fallback": result.get("fallback", False) if isinstance(result, dict) else False
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI similarity check failed: {str(e)}")

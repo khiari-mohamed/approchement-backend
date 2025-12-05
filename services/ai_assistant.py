@@ -1,5 +1,6 @@
 import google.generativeai as genai
-from config import GEMINI_API_KEY, AI_CONFIG
+import anthropic
+from config import GEMINI_API_KEY, CLAUDE_API_KEY, AI_CONFIG
 from utils.logger import log_ai_call
 import json
 import time
@@ -7,12 +8,18 @@ from typing import Dict, Optional
 from threading import Lock
 from collections import deque
 
-# Initialize Gemini
+# Initialize AI providers (3-tier fallback: Gemini → Claude → Backend)
+gemini_model = None
+claude_client = None
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(AI_CONFIG["model_name"])
-else:
-    model = None
+    gemini_model = genai.GenerativeModel(AI_CONFIG["gemini_model"])
+
+if CLAUDE_API_KEY:
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+
+model = gemini_model  # Keep for backward compatibility
 
 # AI Performance tracking (Cahier des Charges)
 ai_metrics = {
@@ -29,6 +36,56 @@ rate_limit_lock = Lock()
 request_timestamps = deque(maxlen=10)
 MAX_REQUESTS_PER_MINUTE = 8  # Conservative limit (10 is max, use 8 for safety)
 MIN_REQUEST_INTERVAL = 60.0 / MAX_REQUESTS_PER_MINUTE  # ~7.5 seconds
+
+def call_ai(prompt: str, max_tokens: int = 50) -> str:
+    """3-tier AI fallback: Gemini → Claude → Exception"""
+    
+    # Tier 1: Try Gemini first
+    if gemini_model:
+        try:
+            response = gemini_model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": AI_CONFIG["temperature"],
+                    "max_output_tokens": max_tokens
+                },
+                request_options={"timeout": 5}
+            )
+            return response.text
+        except Exception as gemini_error:
+            # Gemini failed (quota/error), try Claude
+            if claude_client:
+                try:
+                    response = claude_client.messages.create(
+                        model=AI_CONFIG["claude_model"],
+                        max_tokens=max_tokens,
+                        temperature=AI_CONFIG["temperature"],
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    return response.content[0].text
+                except Exception as claude_error:
+                    # Both AI providers failed, raise exception for backend fallback
+                    raise Exception(f"All AI providers failed: Gemini={str(gemini_error)[:50]}, Claude={str(claude_error)[:50]}")
+            else:
+                # No Claude available, raise Gemini error
+                raise gemini_error
+    
+    # Tier 2: Gemini not available, try Claude
+    elif claude_client:
+        try:
+            response = claude_client.messages.create(
+                model=AI_CONFIG["claude_model"],
+                max_tokens=max_tokens,
+                temperature=AI_CONFIG["temperature"],
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return response.content[0].text
+        except Exception as claude_error:
+            raise claude_error
+    
+    # Tier 3: No AI providers available
+    else:
+        raise Exception("No AI provider available")
 
 def wait_for_rate_limit():
     """Enforce rate limiting to prevent quota errors"""
@@ -74,19 +131,10 @@ Examples:
 Number only:"""
 
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": AI_CONFIG["temperature"],
-                "max_output_tokens": 10
-            },
-            request_options={"timeout": 5}  # 5 second timeout as per Cahier des Charges
-        )
+        score_text = call_ai(prompt, max_tokens=10).strip()
         
         response_time = (time.time() - start_time) * 1000  # milliseconds
         ai_metrics["total_response_time"] += response_time
-        
-        score_text = response.text.strip()
         score = float(score_text)
         
         # Hallucination detection: score must be between 0 and 1
@@ -147,19 +195,18 @@ Transaction: "{description}"
 Return JSON format: {{"category": "CATEGORY_NAME", "confidence": 0.85}}"""
 
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": AI_CONFIG["temperature"],
-                "max_output_tokens": 30
-            },
-            request_options={"timeout": 5}
-        )
+        response_text = call_ai(prompt, max_tokens=50).strip()
         
         response_time = (time.time() - start_time) * 1000
         ai_metrics["total_response_time"] += response_time
         
-        result = json.loads(response.text.strip())
+        # Extract JSON from response (handle markdown code blocks)
+        if '```json' in response_text:
+            response_text = response_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in response_text:
+            response_text = response_text.split('```')[1].split('```')[0].strip()
+        
+        result = json.loads(response_text)
         
         # Validate category is in allowed list
         valid_categories = ["FRAIS_BANCAIRE", "VIREMENT_RECU", "VIREMENT_EMIS", 
@@ -199,15 +246,15 @@ PCN Structure:
 Return JSON: {{"valid": true/false, "confidence": 0.90}}"""
 
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": AI_CONFIG["temperature"],
-                "max_output_tokens": 20
-            }
-        )
+        response_text = call_ai(prompt, max_tokens=30).strip()
         
-        result = json.loads(response.text.strip())
+        # Extract JSON from response (handle markdown code blocks)
+        if '```json' in response_text:
+            response_text = response_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in response_text:
+            response_text = response_text.split('```')[1].split('```')[0].strip()
+        
+        result = json.loads(response_text)
         log_ai_call("validate_pcn_account", {"account_code": account_code}, result)
         return result
     except Exception as e:
@@ -240,19 +287,18 @@ Common accounts:
 Return JSON: {{"account": "512000", "confidence": 0.80}}"""
 
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": AI_CONFIG["temperature"],
-                "max_output_tokens": 25
-            },
-            request_options={"timeout": 5}
-        )
+        response_text = call_ai(prompt, max_tokens=30).strip()
         
         response_time = (time.time() - start_time) * 1000
         ai_metrics["total_response_time"] += response_time
         
-        result = json.loads(response.text.strip())
+        # Extract JSON from response (handle markdown code blocks)
+        if '```json' in response_text:
+            response_text = response_text.split('```json')[1].split('```')[0].strip()
+        elif '```' in response_text:
+            response_text = response_text.split('```')[1].split('```')[0].strip()
+        
+        result = json.loads(response_text)
         
         # Validate account format (6 digits)
         if not result.get("account", "").isdigit() or len(result.get("account", "")) != 6:
