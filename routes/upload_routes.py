@@ -61,12 +61,19 @@ async def upload_bank_file(
             user_id="system"
         )
         
-        # Save processed CSV for reconciliation
-        processed_path = os.path.join(UPLOAD_DIR, f"{file_record.id}_processed.csv")
-        df.to_csv(processed_path, index=False)
-        
-        # Update file path to processed version
-        file_record.file_path = processed_path
+        # Save transactions to database (no CSV needed)
+        from db_models.transactions import BankTransaction
+        from utils.date_parser import parse_date_to_python_date
+        for _, row in df.iterrows():
+            tx = BankTransaction(
+                id=str(row['id']),
+                file_id=file_record.id,
+                date=parse_date_to_python_date(row['date']),
+                amount=float(row['amount']),
+                description=str(row['description']),
+                currency=str(row.get('currency', 'TND'))
+            )
+            db.add(tx)
         db.commit()
         
         log_upload(file.filename, "bank", len(df))
@@ -127,12 +134,19 @@ async def upload_accounting_file(
             user_id="system"
         )
         
-        # Save processed CSV for reconciliation
-        processed_path = os.path.join(UPLOAD_DIR, f"{file_record.id}_processed.csv")
-        df.to_csv(processed_path, index=False)
-        
-        # Update file path to processed version
-        file_record.file_path = processed_path
+        # Save transactions to database (no CSV needed)
+        from db_models.transactions import AccountingTransaction
+        from utils.date_parser import parse_date_to_python_date
+        for _, row in df.iterrows():
+            tx = AccountingTransaction(
+                id=str(row['id']),
+                file_id=file_record.id,
+                date=parse_date_to_python_date(row['date']),
+                amount=float(row['amount']),
+                description=str(row['description']),
+                account_code=str(row.get('account_code', ''))
+            )
+            db.add(tx)
         db.commit()
         
         log_upload(file.filename, "accounting", len(df))

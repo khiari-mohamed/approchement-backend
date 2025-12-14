@@ -8,6 +8,7 @@ from models import *
 from services.ai_assistant import compare_labels, categorize_transaction
 from services.validation_service import ValidationService
 from services.gap_calculator import GapCalculator
+from services.tunisian_config import TunisianBankConfig
 from utils.logger import log_matching_step
 
 class ReconciliationEngine:
@@ -28,55 +29,43 @@ class ReconciliationEngine:
         bank_df = self._normalize_dataframe(bank_df)
         accounting_df = self._normalize_dataframe(accounting_df)
         
-        # Calculate totals
-        bank_total = bank_df['amount'].sum()
-        accounting_total = accounting_df['amount'].sum()
-        initial_gap = abs(bank_total - accounting_total)
+        # Add normalized transaction types
+        bank_df['tx_type'] = bank_df['description'].apply(TunisianBankConfig.normalize_transaction_type)
+        accounting_df['tx_type'] = accounting_df['description'].apply(TunisianBankConfig.normalize_transaction_type)
+        
+        # Calculate real balances (not sum of transactions)
+        bank_total = self._calculate_bank_balance(bank_df)
+        accounting_total = self._calculate_accounting_balance(accounting_df)
+        initial_gap = bank_total - accounting_total
         
         matches = []
         used_bank_ids = set()
         used_accounting_ids = set()
         ai_assisted_count = 0
         
-        # Tier 1: Exact matches
-        exact_matches = self._find_exact_matches(bank_df, accounting_df)
-        self._update_used_ids(exact_matches, used_bank_ids, used_accounting_ids)
-        matches.extend(exact_matches)
+        # LEVEL 1: Exact matches (amount + date ±3 days + same sign)
+        level1_matches = self._find_level1_matches(bank_df, accounting_df)
+        self._update_used_ids(level1_matches, used_bank_ids, used_accounting_ids)
+        matches.extend(level1_matches)
+        print(f"DEBUG: Level 1 matched {len(level1_matches)} transactions")
         
-        # Tier 2: Fuzzy matches (strong)
+        # LEVEL 2: Amount only + date tolerance = 5 days
+        remaining_bank = bank_df[~bank_df['id'].isin(used_bank_ids)]
+        remaining_accounting = accounting_df[~accounting_df['id'].isin(used_accounting_ids)]
+        print(f"DEBUG: Level 2 - Remaining bank: {len(remaining_bank)}, accounting: {len(remaining_accounting)}")
+        
+        level2_matches = self._find_level2_matches(remaining_bank, remaining_accounting)
+        self._update_used_ids(level2_matches, used_bank_ids, used_accounting_ids)
+        matches.extend(level2_matches)
+        print(f"DEBUG: Level 2 matched {len(level2_matches)} transactions")
+        
+        # LEVEL 3: Group matching (sum = sum)
         remaining_bank = bank_df[~bank_df['id'].isin(used_bank_ids)]
         remaining_accounting = accounting_df[~accounting_df['id'].isin(used_accounting_ids)]
         
-        fuzzy_strong = self._find_fuzzy_matches(remaining_bank, remaining_accounting, strong=True)
-        self._update_used_ids(fuzzy_strong, used_bank_ids, used_accounting_ids)
-        matches.extend(fuzzy_strong)
-        
-        # Tier 3: AI-assisted matches
-        if self.rules.enable_ai_assistance:
-            remaining_bank = bank_df[~bank_df['id'].isin(used_bank_ids)]
-            remaining_accounting = accounting_df[~accounting_df['id'].isin(used_accounting_ids)]
-            
-            ai_matches = self._find_ai_matches(remaining_bank, remaining_accounting)
-            self._update_used_ids(ai_matches, used_bank_ids, used_accounting_ids)
-            matches.extend(ai_matches)
-            ai_assisted_count = len(ai_matches)
-        
-        # Tier 4: Weak fuzzy matches
-        remaining_bank = bank_df[~bank_df['id'].isin(used_bank_ids)]
-        remaining_accounting = accounting_df[~accounting_df['id'].isin(used_accounting_ids)]
-        
-        fuzzy_weak = self._find_fuzzy_matches(remaining_bank, remaining_accounting, strong=False)
-        self._update_used_ids(fuzzy_weak, used_bank_ids, used_accounting_ids)
-        matches.extend(fuzzy_weak)
-        
-        # Tier 5: Group matches
-        if self.rules.enable_group_matching:
-            remaining_bank = bank_df[~bank_df['id'].isin(used_bank_ids)]
-            remaining_accounting = accounting_df[~accounting_df['id'].isin(used_accounting_ids)]
-            
-            group_matches = self._find_group_matches(remaining_bank, remaining_accounting)
-            self._update_used_ids(group_matches, used_bank_ids, used_accounting_ids)
-            matches.extend(group_matches)
+        level3_matches = self._find_level3_group_matches(remaining_bank, remaining_accounting)
+        self._update_used_ids(level3_matches, used_bank_ids, used_accounting_ids)
+        matches.extend(level3_matches)
         
         # Create suspense items
         suspense = self._create_suspense_items(bank_df, accounting_df, used_bank_ids, used_accounting_ids)
@@ -166,38 +155,49 @@ class ReconciliationEngine:
         return result
     
     def _normalize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize CSV data"""
+        """Normalize CSV data with Tunisian decimal format"""
         df = df.copy()
         
         if 'id' not in df.columns:
             df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
         
         if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce').dt.date
+            # Keep as Timestamp for proper date arithmetic
+            df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
         
         if 'amount' in df.columns:
-            df['amount'] = df['amount'].astype(str).str.replace(',', '').str.replace(' ', '')
-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+            # CRITIQUE : Format tunisien : 1.177.437,649 = 1177437.649
+            df['amount'] = df['amount'].astype(str).apply(TunisianBankConfig.normalize_tunisian_amount)
         
         if 'description' in df.columns:
             df['description'] = df['description'].fillna('').astype(str).str.strip()
         
-        return df.dropna(subset=['date', 'amount'])
+        # Garder toutes les lignes pour l'analyse
+        return df
     
     def _find_exact_matches(self, bank_df: pd.DataFrame, accounting_df: pd.DataFrame) -> List[Match]:
         """Tier 1: Exact amount + date + high label similarity"""
         matches = []
         
-        for _, bank_row in bank_df.iterrows():
+        # N'essayer de matcher que les transactions non-soldes
+        non_solde_bank = bank_df[~bank_df['description'].str.contains('SOLDE', case=False, na=False)]
+        
+        for _, bank_row in non_solde_bank.iterrows():
+            # Recherche par montant exact (tolérance de 0.01 pour arrondis)
             candidates = accounting_df[
-                (abs(accounting_df['amount'] - bank_row['amount']) <= self.rules.amount_tolerance)
+                (abs(accounting_df['amount'] - bank_row['amount']) <= 0.01)
             ]
             
             for _, acc_row in candidates.iterrows():
+                # Tolérance de date plus grande (jusqu'à 7 jours)
                 date_diff = abs((bank_row['date'] - acc_row['date']).days)
-                if date_diff <= self.rules.date_tolerance_days:
-                    similarity = fuzz.token_sort_ratio(bank_row['description'], acc_row['description'])
-                    if similarity >= self.rules.label_similarity_threshold:
+                if date_diff <= 7:  # Augmenté de 1 à 7 jours
+                    # Similarité plus flexible
+                    bank_desc = str(bank_row['description']).upper()
+                    acc_desc = str(acc_row['description']).upper()
+                    similarity = fuzz.token_sort_ratio(bank_desc, acc_desc)
+                    
+                    if similarity >= 60:  # Baissé de 80 à 60
                         match = self._create_match(bank_row, acc_row, similarity/100, MatchRule.EXACT)
                         matches.append(match)
                         break
@@ -370,7 +370,9 @@ class ReconciliationEngine:
     def _calculate_composite_score(self, bank_row, acc_row, similarity: float) -> float:
         """Calculate weighted composite score"""
         amount_score = 1 - (abs(bank_row['amount'] - acc_row['amount']) / max(abs(bank_row['amount']), 1))
-        date_score = max(0, 1 - abs((bank_row['date'] - acc_row['date']).days) / 7)
+        bank_date = pd.to_datetime(bank_row['date'])
+        acc_date = pd.to_datetime(acc_row['date'])
+        date_score = max(0, 1 - abs((bank_date - acc_date).days) / 7)
         label_score = similarity / 100
         
         return 0.5 * amount_score + 0.2 * date_score + 0.3 * label_score
@@ -404,6 +406,161 @@ class ReconciliationEngine:
                 used_acc_ids.add(match.accounting_tx.id)
             if match.accounting_txs:
                 used_acc_ids.update([tx.id for tx in match.accounting_txs])
+    
+    def _find_level1_matches(self, bank_df: pd.DataFrame, accounting_df: pd.DataFrame) -> List[Match]:
+        """LEVEL 1: Exact amount + date (±3 days) + same sign"""
+        matches = []
+        used_acc_ids = set()
+        
+        for _, bank_row in bank_df.iterrows():
+            # Skip balance lines
+            if 'SOLDE' in str(bank_row['description']).upper():
+                continue
+                
+            candidates = accounting_df[
+                (accounting_df['amount'] == bank_row['amount']) &  # Exact amount
+                (accounting_df['amount'] != 0) &  # Not zero
+                (~accounting_df['id'].isin(used_acc_ids))  # Not already matched
+            ]
+            
+            for _, acc_row in candidates.iterrows():
+                try:
+                    # Handle both date and datetime objects
+                    bank_date = bank_row['date']
+                    acc_date = acc_row['date']
+                    
+                    # Convert to datetime if needed
+                    if not isinstance(bank_date, (pd.Timestamp, datetime)):
+                        bank_date = pd.to_datetime(bank_date)
+                    if not isinstance(acc_date, (pd.Timestamp, datetime)):
+                        acc_date = pd.to_datetime(acc_date)
+                    
+                    date_diff = abs((bank_date - acc_date).days)
+                except:
+                    date_diff = 999  # Set high to prevent matching on error
+                    
+                if date_diff <= 3:  # ±3 days
+                    match = self._create_match(bank_row, acc_row, 1.0, MatchRule.EXACT)
+                    matches.append(match)
+                    used_acc_ids.add(acc_row['id'])
+                    break  # Take first match
+        
+        return matches
+    
+    def _find_level2_matches(self, bank_df: pd.DataFrame, accounting_df: pd.DataFrame) -> List[Match]:
+        """LEVEL 2: Amount only + date tolerance = 5 days"""
+        matches = []
+        used_acc_ids = set()
+        
+        for _, bank_row in bank_df.iterrows():
+            # Skip balance lines
+            if 'SOLDE' in str(bank_row['description']).upper():
+                continue
+            
+            # Find candidates with exact amount match
+            candidates = accounting_df[
+                (accounting_df['amount'] == bank_row['amount']) &  # Exact amount
+                (accounting_df['amount'] != 0) &
+                (~accounting_df['id'].isin(used_acc_ids))
+            ]
+            
+            if len(candidates) == 0:
+                print(f"DEBUG L2: No candidates for {bank_row['description']} amount={bank_row['amount']}")
+                continue
+            
+            for _, acc_row in candidates.iterrows():
+                try:
+                    bank_date = bank_row['date']
+                    acc_date = acc_row['date']
+                    
+                    print(f"DEBUG L2: bank_date={bank_date} type={type(bank_date)}, acc_date={acc_date} type={type(acc_date)}")
+                    
+                    # Convert to Timestamp
+                    if not isinstance(bank_date, pd.Timestamp):
+                        bank_date = pd.Timestamp(bank_date)
+                    if not isinstance(acc_date, pd.Timestamp):
+                        acc_date = pd.Timestamp(acc_date)
+                    
+                    date_diff = abs((bank_date - acc_date).days)
+                    print(f"DEBUG L2: {bank_row['description']} date_diff={date_diff}")
+                except Exception as e:
+                    print(f"DEBUG L2: ERROR: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    date_diff = 999
+                    
+                if date_diff <= 5:  # ±5 days
+                    match = self._create_match(bank_row, acc_row, 0.9, MatchRule.FUZZY_STRONG)
+                    matches.append(match)
+                    used_acc_ids.add(acc_row['id'])
+                    print(f"DEBUG L2: ✅ MATCHED {bank_row['description']}")
+                    break  # Take first match
+        
+        return matches
+    
+    def _find_level3_group_matches(self, bank_df: pd.DataFrame, accounting_df: pd.DataFrame) -> List[Match]:
+        """LEVEL 3: Group matching (sum = sum)"""
+        matches = []
+        
+        for _, bank_row in bank_df.iterrows():
+            # Skip balance lines
+            if 'SOLDE' in str(bank_row['description']).upper():
+                continue
+                
+            bank_amount = bank_row['amount']
+            bank_date = pd.to_datetime(bank_row['date'])
+            
+            # Look for groups of accounting entries that sum to bank amount
+            # within ±5 days
+            acc_dates = pd.to_datetime(accounting_df['date'])
+            date_window = accounting_df[
+                (abs((acc_dates - bank_date).dt.days) <= 5) &
+                (accounting_df['amount'] != 0)
+            ]
+            
+            if len(date_window) > 1:
+                # Try different group sizes
+                for group_size in range(2, min(10, len(date_window) + 1)):
+                    for start_idx in range(len(date_window) - group_size + 1):
+                        group = date_window.iloc[start_idx:start_idx + group_size]
+                        group_sum = group['amount'].sum()
+                        
+                        if abs(group_sum - bank_amount) < 0.01:  # Exact sum match
+                            # Create group match
+                            bank_tx = self._row_to_transaction(bank_row)
+                            acc_txs = [self._row_to_transaction(row) for _, row in group.iterrows()]
+                            
+                            match = Match(
+                                id=str(uuid.uuid4()),
+                                bank_tx=bank_tx,
+                                accounting_txs=acc_txs,
+                                score=0.8,
+                                rule=MatchRule.GROUP,
+                                status=MatchStatus.MATCHED
+                            )
+                            matches.append(match)
+                            break
+                    if matches and matches[-1].bank_tx.id == bank_row['id']:
+                        break  # Found match for this bank row
+        
+        return matches
+    
+    def _calculate_bank_balance(self, bank_df: pd.DataFrame) -> float:
+        """Calculate final bank balance from statement"""
+        balance_rows = bank_df[bank_df['description'].str.contains('SOLDE', case=False, na=False)]
+        
+        if not balance_rows.empty:
+            return float(balance_rows.iloc[-1]['amount'])
+        else:
+            non_balance = bank_df[~bank_df['description'].str.contains('SOLDE', case=False, na=False)]
+            return float(non_balance['amount'].sum())
+    
+    def _calculate_accounting_balance(self, accounting_df: pd.DataFrame) -> float:
+        """Calculate final accounting balance from ledger"""
+        if 'solde_progressif' in accounting_df.columns:
+            return float(accounting_df['solde_progressif'].iloc[-1])
+        else:
+            return float(accounting_df['amount'].sum())
     
     def _row_to_transaction(self, row) -> Transaction:
         """Convert DataFrame row to Transaction model"""

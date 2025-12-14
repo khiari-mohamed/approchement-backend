@@ -12,10 +12,11 @@ def generate_recon_id(counter: int, prefix: str = "R") -> str:
     return f"{prefix}{counter:06d}"
 
 def safe_float_conversion(value: Any) -> float:
-    """Safely convert value to float"""
+    """Safely convert value to float with Tunisian format support"""
     try:
         if isinstance(value, str):
-            value = value.replace(',', '.').replace(' ', '')
+            # Tunisian format: remove dots, replace comma with dot
+            value = value.replace('.', '').replace(',', '.').replace(' ', '').replace('TND', '').replace('DT', '')
         return float(value)
     except (ValueError, TypeError):
         return 0.0

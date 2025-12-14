@@ -21,11 +21,20 @@ class GapCalculator:
     def calculate_all_gaps(self, bank_df: pd.DataFrame, accounting_df: pd.DataFrame,
                           matches: List[Dict], suspense: List[Dict]) -> Dict:
         """
-        Calculate all gap metrics in real-time
+        Calculate all gap metrics with real balances
         """
-        # Calculate totals
-        bank_total = float(bank_df['amount'].sum())
-        accounting_total = float(accounting_df['amount'].sum())
+        # Calculate real balances (not sum of transactions)
+        bank_balance_rows = bank_df[bank_df['description'].str.contains('SOLDE', case=False, na=False)]
+        if not bank_balance_rows.empty:
+            bank_total = float(bank_balance_rows.iloc[-1]['amount'])
+        else:
+            non_balance = bank_df[~bank_df['description'].str.contains('SOLDE', case=False, na=False)]
+            bank_total = float(non_balance['amount'].sum())
+        
+        if 'solde_progressif' in accounting_df.columns:
+            accounting_total = float(accounting_df['solde_progressif'].iloc[-1])
+        else:
+            accounting_total = float(accounting_df['amount'].sum())
         
         # Formula 1: Écart initial = Solde bancaire - Solde comptable
         initial_gap = bank_total - accounting_total
@@ -55,14 +64,15 @@ class GapCalculator:
         else:
             coverage_percentage = 100.0 if abs(residual_gap) < 0.01 else 0.0
         
-        # Calculate matched amount
+        # Calculate matched amount (handle both dict and Match objects)
         matched_amount = sum([
-            float(m.get('bank_tx', {}).get('amount', 0))
+            float(m.bank_tx.amount if hasattr(m, 'bank_tx') else m.get('bank_tx', {}).get('amount', 0))
             for m in matches
         ])
         
-        # Calculate coverage ratio (matched / total)
-        coverage_ratio = len(matches) / max(len(bank_df), len(accounting_df)) if max(len(bank_df), len(accounting_df)) > 0 else 0.0
+        # Calculate coverage ratio (matched / total transactions excluding balances)
+        bank_tx_count = len(bank_df[~bank_df['description'].str.contains('SOLDE', case=False, na=False)])
+        coverage_ratio = len(matches) / max(bank_tx_count, 1) if bank_tx_count > 0 else 0.0
         
         self.calculations = {
             # Basic totals
@@ -87,8 +97,8 @@ class GapCalculator:
             
             # Validation flags
             "is_balanced": abs(residual_gap) < 0.01,
-            "requires_investigation": abs(residual_gap) > (abs(bank_total) * 0.01),
-            "high_suspense": len(suspense) > 10
+            "requires_investigation": abs(residual_gap) > 1000,
+            "high_suspense": len(suspense) > (bank_tx_count * 0.3) if bank_tx_count > 0 else len(suspense) > 10
         }
         
         return self.calculations

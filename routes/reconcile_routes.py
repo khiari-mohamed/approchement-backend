@@ -16,6 +16,7 @@ from services.export_service import ExportService
 from services.pcn_service import PCNService
 from services.ai_assistant import get_ai_metrics
 from utils.logger import log_matching_step, log_reconciliation_complete, log_error
+from utils.date_parser import parse_date_to_python_date
 from routes.auth_routes import get_current_user
 from db_models.users import User
 from database import get_db
@@ -71,46 +72,37 @@ async def start_reconciliation(
             user_id="system"  # Use system user for now
         )
         
-        # Load and process files
-        bank_df = pd.read_csv(bank_file.file_path)
-        acc_df = pd.read_csv(acc_file.file_path)
+        # Load transactions from database (already saved during upload)
+        bank_txs = db.query(BankTransaction).filter(BankTransaction.file_id == bank_file.id).all()
+        acc_txs = db.query(AccountingTransaction).filter(AccountingTransaction.file_id == acc_file.id).all()
+        
+        # Convert to DataFrames
+        bank_df = pd.DataFrame([{
+            'id': tx.id,
+            'date': pd.Timestamp(tx.date),
+            'amount': tx.amount,
+            'description': tx.description,
+            'currency': tx.currency
+        } for tx in bank_txs])
+        
+        acc_df = pd.DataFrame([{
+            'id': tx.id,
+            'date': pd.Timestamp(tx.date),
+            'amount': tx.amount,
+            'description': tx.description,
+            'account_code': tx.account_code
+        } for tx in acc_txs])
+        
+        print(f"DEBUG: Loaded {len(bank_df)} bank and {len(acc_df)} accounting transactions from DB")
         
         # Initialize reconciliation engine
         engine = ReconciliationEngine(rules)
         
-        # Run reconciliation
+        # Run reconciliation AFTER transactions are persisted
         log_matching_step("reconciliation_started", {"job_id": recon.id})
         result = engine.reconcile(bank_df, acc_df)
         
-        # Save bank transactions to database with their IDs
-        for _, row in bank_df.iterrows():
-            if 'id' in row and pd.notna(row['id']):
-                bank_tx = BankTransaction(
-                    id=str(row['id']),
-                    file_id=bank_file.id,
-                    date=pd.to_datetime(row['date']).date(),
-                    amount=float(row['amount']),
-                    description=str(row.get('description', '')),
-                    currency=str(row.get('currency', 'TND'))
-                )
-                db.add(bank_tx)
-        
-        # Save accounting transactions to database with their IDs
-        for _, row in acc_df.iterrows():
-            if 'id' in row and pd.notna(row['id']):
-                acc_tx = AccountingTransaction(
-                    id=str(row['id']),
-                    file_id=acc_file.id,
-                    date=pd.to_datetime(row['date']).date(),
-                    amount=float(row['amount']),
-                    description=str(row.get('description', '')),
-                    account_code=str(row.get('account_code', '')) if 'account_code' in row else None
-                )
-                db.add(acc_tx)
-        
-        db.commit()
-        
-        # Save matches to database
+        # Save matches to database (no need to re-save transactions, already done)
         matches_data = []
         for match in result.matches:
             matches_data.append({
